@@ -1,5 +1,6 @@
 """Minimal OpenAI-compatible provider used by cliMEM integration tests."""
 
+import asyncio
 import json
 import os
 import re
@@ -30,6 +31,13 @@ MAX_SCHEMA_DEPTH = _read_positive_int("MOCK_PROVIDER_MAX_SCHEMA_DEPTH", 32)
 fail_mode: dict[str, int] = {}
 delay_mode: dict[str, dict[str, int]] = {}
 request_counts: dict[str, int] = {}
+stream_chaos: dict[str, int | bool] = {
+    "delay_before_ms": 0,
+    "delay_between_ms": 0,
+    "emit_chunks": 1,
+    "disconnect_after": 0,
+    "never_complete": False,
+}
 
 FACT_TEXT = (
     "PostgreSQL was chosen instead of SQLite for cliMEM session storage; "
@@ -354,10 +362,23 @@ async def chat_completions(request: Request):
                 "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}
 
     async def sse_stream():
-        chunk = {"id": "chatcmpl-mock", "object": "chat.completion.chunk",
-                 "choices": [{"index": 0, "delta": {"content": content}}]}
-        yield f"data: {json.dumps(chunk)}\n\n"
-        yield "data: [DONE]\n\n"
+        if stream_chaos["delay_before_ms"]:
+            await asyncio.sleep(int(stream_chaos["delay_before_ms"]) / 1000)
+        chunk_count = max(1, int(stream_chaos["emit_chunks"]))
+        text_parts = [content[index::chunk_count] for index in range(chunk_count)]
+        for index, part in enumerate(text_parts):
+            chunk = {"id": "chatcmpl-mock", "object": "chat.completion.chunk",
+                     "choices": [{"index": 0, "delta": {"content": part}}]}
+            yield f"data: {json.dumps(chunk)}\n\n"
+            if stream_chaos["disconnect_after"] and index + 1 >= int(stream_chaos["disconnect_after"]):
+                return
+            if stream_chaos["delay_between_ms"]:
+                await asyncio.sleep(int(stream_chaos["delay_between_ms"]) / 1000)
+        if not stream_chaos["never_complete"]:
+            yield "data: [DONE]\n\n"
+        else:
+            while True:
+                await asyncio.sleep(1)
 
     return StreamingResponse(sse_stream(), media_type="text/event-stream")
 
@@ -379,6 +400,13 @@ async def reset():
     fail_mode.clear()
     delay_mode.clear()
     request_counts.clear()
+    stream_chaos.update({
+        "delay_before_ms": 0,
+        "delay_between_ms": 0,
+        "emit_chunks": 1,
+        "disconnect_after": 0,
+        "never_complete": False,
+    })
     return {"ok": True}
 
 
@@ -434,6 +462,26 @@ async def set_fail_mode(request: Request):
             delay_mode[model] = {"timeout_ms": timeout_ms, "timeout_every": timeout_every}
             request_counts[model] = 0
     return {"ok": True, "fail_mode": dict(fail_mode), "delay_mode": dict(delay_mode)}
+
+
+@app.post("/chaos/stream")
+async def configure_stream_chaos(request: Request):
+    try:
+        spec = await request.json()
+    except (ValueError, UnicodeDecodeError):
+        return JSONResponse(status_code=400, content={"error": {"type": "invalid_request_error", "code": "invalid_json"}})
+    if not isinstance(spec, dict):
+        return JSONResponse(status_code=400, content={"error": {"type": "invalid_request_error", "code": "invalid_stream_chaos"}})
+    integer_fields = ("delay_before_ms", "delay_between_ms", "emit_chunks", "disconnect_after")
+    for field in integer_fields:
+        value = spec.get(field, stream_chaos[field])
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return JSONResponse(status_code=400, content={"error": {"type": "invalid_request_error", "code": "invalid_stream_chaos", "message": f"{field} must be a non-negative integer"}})
+    if spec.get("emit_chunks", stream_chaos["emit_chunks"]) < 1:
+        return JSONResponse(status_code=400, content={"error": {"type": "invalid_request_error", "code": "invalid_stream_chaos", "message": "emit_chunks must be positive"}})
+    stream_chaos.update({field: spec.get(field, stream_chaos[field]) for field in integer_fields})
+    stream_chaos["never_complete"] = bool(spec.get("never_complete", stream_chaos["never_complete"]))
+    return {"ok": True, "stream_chaos": dict(stream_chaos)}
 
 
 @app.get("/failmode")

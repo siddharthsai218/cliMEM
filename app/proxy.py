@@ -1,11 +1,12 @@
 import asyncio
 import json
 import logging
+import os
 import time
 
 import httpx
 from fastapi import APIRouter, Request
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from .config import (
     API_KEY_FINGERPRINT,
@@ -29,6 +30,9 @@ from .utils import get_cwd
 
 router = APIRouter()
 logger = logging.getLogger("climem")
+PROVIDER_TIMEOUT_SECONDS = float(os.getenv("CLIMEM_PROVIDER_TIMEOUT_SECONDS", "30"))
+if PROVIDER_TIMEOUT_SECONDS <= 0:
+    raise ValueError("CLIMEM_PROVIDER_TIMEOUT_SECONDS must be positive")
 
 
 @router.post("/v1/chat/completions")
@@ -98,7 +102,7 @@ async def chat(request: Request):
         "Accept": "text/event-stream",
     }
 
-    client = httpx.AsyncClient(timeout=None)
+    client = httpx.AsyncClient(timeout=PROVIDER_TIMEOUT_SECONDS)
 
     # Providers like NVIDIA NIM intermittently answer with transient
     # 404/429/5xx even for valid requests. Retry those once transparently,
@@ -124,7 +128,19 @@ async def chat(request: Request):
             headers=headers,
             json=body,
         )
-        response = await client.send(provider_request, stream=True)
+        try:
+            response = await client.send(provider_request, stream=True)
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            logger.warning("provider transport failure for %s: %s", model, exc)
+            if attempt < len(chain) - 1:
+                _log_fallback(model, chain[attempt + 1])
+                await asyncio.sleep(0.1)
+                continue
+            await client.aclose()
+            return JSONResponse(
+                status_code=504,
+                content={"error": {"message": "upstream provider unavailable", "type": "upstream_timeout"}},
+            )
 
         if response.status_code == 200:
             break
@@ -155,7 +171,15 @@ async def chat(request: Request):
             headers=headers,
             json=body,
         )
-        response = await client.send(provider_request, stream=True)
+        try:
+            response = await client.send(provider_request, stream=True)
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            logger.warning("provider retry transport failure for %s: %s", model, exc)
+            await client.aclose()
+            return JSONResponse(
+                status_code=504,
+                content={"error": {"message": "upstream provider unavailable", "type": "upstream_timeout"}},
+            )
         break
 
     elapsed = (time.perf_counter() - start_time) * 1000
@@ -172,10 +196,17 @@ async def chat(request: Request):
 
     async def stream_generator():
         assistant_response = ""
+        pending = ""
 
         try:
             async for chunk in response.aiter_text():
-                for line in chunk.splitlines():
+                pending += chunk
+                lines = pending.splitlines(keepends=True)
+                pending = ""
+                if lines and not lines[-1].endswith(("\n", "\r")):
+                    pending = lines.pop()
+                for line in lines:
+                    line = line.rstrip("\r\n")
                     if not line.startswith("data: "):
                         continue
 

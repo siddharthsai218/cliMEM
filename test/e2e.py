@@ -71,7 +71,7 @@ def start_mock() -> subprocess.Popen:
         [sys.executable, "-m", "uvicorn", "test.mock_provider:app",
          "--port", str(PROVIDER_PORT), "--log-level", "warning"],
         cwd=ROOT,
-        stdout=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
         stderr=subprocess.STDOUT,
     )
 
@@ -132,7 +132,7 @@ def start_climem(log_path: Path, workdir: Path | None = None) -> subprocess.Pope
     })
     env["CLIMEM_ENV_FILE"] = str(overlay)
     log = open(log_path, "ab")
-    return subprocess.Popen(
+    process = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "app.main:app",
          "--host", "127.0.0.1", "--port", str(CLIMEM_PORT), "--log-level", "info"],
         cwd=str(workdir or ROOT),
@@ -140,6 +140,8 @@ def start_climem(log_path: Path, workdir: Path | None = None) -> subprocess.Pope
         stdout=log,
         stderr=subprocess.STDOUT,
     )
+    process._climem_log_handle = log
+    return process
 
 
 def print_stage_diagnostics(stage: str, log_path: Path) -> None:
@@ -192,6 +194,10 @@ def stop_climem(
         proc.wait(timeout=CLEANUP_TIMEOUT)
     except subprocess.TimeoutExpired:
         proc.kill()
+        proc.wait(timeout=2)
+    handle = getattr(proc, "_climem_log_handle", None)
+    if handle is not None and not handle.closed:
+        handle.close()
     return log_path.read_text(errors="replace")
 
 

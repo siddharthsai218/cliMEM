@@ -34,6 +34,9 @@ jobs:
       - name: Run mock-provider schema unit tests
         run: coverage run --branch -m unittest -v test.test_mock_provider_schema test.test_mock_provider_concurrency
 
+      - name: Run streaming chaos tests
+        run: coverage run --branch -m unittest -v test.test_chaos_streaming test.test_chaos_process
+
       - name: Run fallback integration test
         run: python test/fallback_test.py
 
